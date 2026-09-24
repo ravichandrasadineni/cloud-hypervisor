@@ -153,17 +153,20 @@ struct GenericInitiatorAffinity {
 // ACPI fixes this SRAT structure at 32 bytes.
 const _: () = assert!(size_of::<GenericInitiatorAffinity>() == 32);
 
-// ACPI 6.6 Section 5.2.16.6 - PCI device handle
+// ACPI 6.6 Section 5.2.16.6 (Table 5-66) - Device Handle - PCI
 // Bytes 0-1: PCI Segment (little-endian)
-// Byte 2: Bus Number
-// Byte 3: Device Number (bits 7:3) and Function Number (bits 2:0)
+// Bytes 2-3: BDF Number (16-bit little-endian integer: Bus in bits 15:8,
+//            Device in bits 7:3, Function in bits 2:0).
+//            In little-endian byte order:
+//              Byte 2: Device Number (bits 7:3) and Function Number (bits 2:0)
+//              Byte 3: Bus Number
 // Bytes 4-15: Reserved
 #[repr(C, packed)]
 #[derive(Default, IntoBytes, Immutable, FromBytes)]
 struct PciDeviceHandle {
     segment: u16,
-    bus: u8,
     device_function: u8,
+    bus: u8,
     _reserved: [u8; 12],
 }
 
@@ -1305,18 +1308,24 @@ mod tests {
         assert_eq!(gi_reserved2, 0, "Reserved field must be 0");
 
         // Verify PCI BDF encoding in device_handle
-        // ACPI 6.6 Section 5.2.16.6 format:
+        // ACPI 6.6 Section 5.2.16.6 (Table 5-66) format:
         // Bytes 0-1: PCI Segment (little-endian)
-        // Byte 2: Bus Number
-        // Byte 3: Device Number (bits 7:3) and Function Number (bits 2:0)
+        // Byte 2: Device Number (bits 7:3) and Function Number (bits 2:0)
+        // Byte 3: Bus Number
         // Bytes 4-15: Reserved
         //
-        // 0000:00:05.0 -> device_function = (5 << 3) | 0 = 0x28.
-        let expected_handle: [u8; 16] = [0, 0, 0, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // 0000:00:05.0 -> device_function = (5 << 3) | 0 = 0x28, bus = 0.
+        let expected_handle: [u8; 16] = [0, 0, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             gi.device_handle, expected_handle,
             "Device handle must encode PCI BDF correctly per ACPI 6.6 Section 5.2.16.6"
         );
+
+        // Also verify non-zero segment and bus: 0001:02:05.3 -> segment = 1, devfn = 0x2b, bus = 2
+        let bdf_bus = PciBdf::new(1, 2, 5, 3);
+        let gi_bus = GenericInitiatorAffinity::from_pci_bdf(bdf_bus, proximity_domain);
+        let expected_bus_handle: [u8; 16] = [1, 0, 0x2b, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(gi_bus.device_handle, expected_bus_handle);
     }
 
     #[test]
