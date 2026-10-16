@@ -133,6 +133,21 @@ struct ProcessorGiccAffinity {
     pub clock_domain: u32,
 }
 
+// ACPI 6.4+ Section 5.2.16.4 - GIC ITS Affinity Structure
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct GicItsAffinity {
+    pub type_: u8,
+    pub length: u8,
+    pub proximity_domain: u32,
+    pub _reserved: u16,
+    pub its_id: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(size_of::<GicItsAffinity>() == 12);
+
 // ACPI 6.6 Section 5.2.16.6 - Generic Initiator Affinity Structure
 // Associates devices (e.g., GPUs, NVMe, accelerators) with NUMA proximity domains
 //
@@ -455,7 +470,7 @@ fn create_tpm2_table() -> Sdt {
 
 fn create_srat_table(
     numa_nodes: &NumaNodes,
-    device_manager: &DeviceManager,
+    device_manager: Option<&DeviceManager>,
     #[cfg(target_arch = "x86_64")] topology: Option<(u16, u16, u16, u16)>,
 ) -> Sdt {
     let mut srat = Sdt::new(*b"SRAT", 36, 3, *b"CLOUDH", *b"CHSRAT  ", 1);
@@ -516,7 +531,7 @@ fn create_srat_table(
         // Add Generic Initiator Affinity structures for device-only NUMA nodes
         if let Some(device_id) = &node.device_id {
             // Resolve device_id to guest BDF
-            if let Some(bdf) = device_manager.get_device_bdf(device_id) {
+            if let Some(bdf) = device_manager.and_then(|dm| dm.get_device_bdf(device_id)) {
                 srat.append(GenericInitiatorAffinity::from_pci_bdf(
                     bdf,
                     proximity_domain,
@@ -526,6 +541,25 @@ fn create_srat_table(
             }
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    if !numa_nodes.is_empty() {
+        let its_proximity_domain = numa_nodes
+            .iter()
+            .find(|(_, node)| node.pci_segments.contains(&0))
+            .map(|(node_id, _)| *node_id)
+            .or_else(|| numa_nodes.keys().next().copied())
+            .unwrap_or(0);
+
+        srat.append(GicItsAffinity {
+            type_: 4,
+            length: 12,
+            proximity_domain: its_proximity_domain,
+            _reserved: 0,
+            its_id: 0,
+        });
+    }
+
     srat
 }
 
@@ -1268,7 +1302,7 @@ fn create_acpi_tables_internal(
         // SRAT
         let srat = create_srat_table(
             numa_nodes,
-            device_manager,
+            Some(device_manager),
             #[cfg(target_arch = "x86_64")]
             topology,
         );
@@ -1461,7 +1495,7 @@ pub(crate) fn create_acpi_tables_tdx(
         // SRAT
         tables.push(create_srat_table(
             numa_nodes,
-            device_manager,
+            Some(device_manager),
             #[cfg(target_arch = "x86_64")]
             topology,
         ));
@@ -1646,5 +1680,97 @@ mod tests {
             gi.device_handle, expected_handle,
             "Device handle must encode HID and UID correctly"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_gic_its_affinity_layout() {
+        assert_eq!(size_of::<GicItsAffinity>(), 12);
+
+        let its_aff = GicItsAffinity {
+            type_: 4,
+            length: 12,
+            proximity_domain: 0x0102_0304,
+            _reserved: 0,
+            its_id: 0x0506_0708,
+        };
+
+        let bytes = its_aff.as_bytes();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(bytes[0], 4, "Offset 0: Type (4 = GIC ITS Affinity)");
+        assert_eq!(bytes[1], 12, "Offset 1: Length (12 bytes)");
+        assert_eq!(
+            &bytes[2..6],
+            &0x0102_0304u32.to_le_bytes(),
+            "Offset 2..6: Proximity Domain"
+        );
+        assert_eq!(&bytes[6..8], &[0, 0], "Offset 6..8: Reserved");
+        assert_eq!(
+            &bytes[8..12],
+            &0x0506_0708u32.to_le_bytes(),
+            "Offset 8..12: ITS ID"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_create_srat_table_includes_gic_its_affinity() {
+        use arch::NumaNode;
+
+        let mut numa_nodes = NumaNodes::new();
+        numa_nodes.insert(
+            0,
+            NumaNode {
+                cpus: vec![0, 1],
+                ..Default::default()
+            },
+        );
+        numa_nodes.insert(
+            1,
+            NumaNode {
+                cpus: vec![2, 3],
+                pci_segments: vec![0],
+                ..Default::default()
+            },
+        );
+
+        let srat = create_srat_table(&numa_nodes, None);
+        let bytes = srat.as_slice();
+
+        // SRAT header is 36 bytes + 12 bytes reserved = 48 bytes
+        assert!(bytes.len() > 48);
+        let mut offset = 48;
+        let mut gicc_count = 0;
+        let mut its_affinities: Vec<GicItsAffinity> = Vec::new();
+
+        while offset < bytes.len() {
+            let subtable_type = bytes[offset];
+            let subtable_len = bytes[offset + 1] as usize;
+            assert!(subtable_len >= 2);
+            assert!(offset + subtable_len <= bytes.len());
+
+            match subtable_type {
+                3 => {
+                    assert_eq!(subtable_len, size_of::<ProcessorGiccAffinity>());
+                    gicc_count += 1;
+                }
+                4 => {
+                    assert_eq!(subtable_len, size_of::<GicItsAffinity>());
+                    let its_aff =
+                        GicItsAffinity::read_from_bytes(&bytes[offset..offset + subtable_len])
+                            .unwrap();
+                    its_affinities.push(its_aff);
+                }
+                _ => {}
+            }
+            offset += subtable_len;
+        }
+
+        assert_eq!(gicc_count, 4);
+        assert_eq!(its_affinities.len(), 1);
+        let prox_domain = its_affinities[0].proximity_domain;
+        let its_id = its_affinities[0].its_id;
+        assert_eq!(prox_domain, 1);
+        assert_eq!(its_id, 0);
     }
 }
