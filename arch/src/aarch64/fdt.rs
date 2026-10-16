@@ -519,6 +519,7 @@ fn create_chosen_node(
 
 fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> FdtWriterResult<()> {
     let gic_reg_prop = gic_device.lock().unwrap().device_properties();
+    let redist_region_count = gic_device.lock().unwrap().redist_regions().len();
 
     let intc_node = fdt.begin_node("intc")?;
 
@@ -528,6 +529,9 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> Fd
     // interrupt source. The type shall be a <u32> and the value shall be 3 if no PPI affinity description
     // is required.
     fdt.property_u32("#interrupt-cells", 3)?;
+    if redist_region_count > 1 {
+        fdt.property_u32("#redistributor-regions", redist_region_count as u32)?;
+    }
     fdt.property_array_u64("reg", &gic_reg_prop)?;
     fdt.property_u32("phandle", GIC_PHANDLE)?;
     fdt.property_u32("#address-cells", 2)?;
@@ -1184,5 +1188,94 @@ mod tests {
         let mut fdt = FdtWriter::new().unwrap();
         let result = create_distance_map_node(&mut fdt, &numa_nodes);
         assert!(result.is_ok(), "Should default to 20 for missing distances");
+    }
+
+    use hypervisor::arch::aarch64::gic::{GicState, RedistRegion, Result as GicResult};
+
+    struct DummyMultiRegionVgic {
+        redist_regions: Vec<RedistRegion>,
+    }
+
+    impl Vgic for DummyMultiRegionVgic {
+        fn fdt_compatibility(&self) -> &str {
+            "arm,gic-v3"
+        }
+
+        fn fdt_maint_irq(&self) -> u32 {
+            9
+        }
+
+        fn device_properties(&self) -> Vec<u64> {
+            let mut props = vec![0x0800_0000, 0x0001_0000];
+            for region in &self.redist_regions {
+                props.push(region.base_addr);
+                props.push(region.size);
+            }
+            props
+        }
+
+        fn redist_regions(&self) -> &[RedistRegion] {
+            &self.redist_regions
+        }
+
+        fn vcpu_count(&self) -> u64 {
+            4
+        }
+
+        fn msi_compatible(&self) -> bool {
+            true
+        }
+
+        fn msi_compatibility(&self) -> &str {
+            "arm,gic-v3-its"
+        }
+
+        fn msi_properties(&self) -> [u64; 2] {
+            [0x07f6_0000, 0x0002_0000]
+        }
+
+        fn state(&self) -> GicResult<GicState> {
+            unimplemented!()
+        }
+
+        fn set_state(&mut self, _state: &GicState) -> GicResult<()> {
+            unimplemented!()
+        }
+
+        fn save_data_tables(&self) -> GicResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_create_gic_node_multi_region() {
+        let gic: Arc<Mutex<dyn Vgic>> = Arc::new(Mutex::new(DummyMultiRegionVgic {
+            redist_regions: vec![
+                RedistRegion {
+                    base_addr: 0x07fc_0000,
+                    size: 0x0004_0000,
+                    count: 2,
+                },
+                RedistRegion {
+                    base_addr: 0x07f8_0000,
+                    size: 0x0004_0000,
+                    count: 2,
+                },
+            ],
+        }));
+
+        let mut fdt = FdtWriter::new().unwrap();
+        let root_node = fdt.begin_node("").unwrap();
+        create_gic_node(&mut fdt, &gic).unwrap();
+        fdt.end_node(root_node).unwrap();
+        let fdt_bytes = fdt.finish().unwrap();
+
+        // Verify "#redistributor-regions" string is present in the FDT string table
+        let needle = b"#redistributor-regions\0";
+        assert!(
+            fdt_bytes
+                .windows(needle.len())
+                .any(|window| window == needle)
+        );
     }
 }

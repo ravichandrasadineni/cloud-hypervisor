@@ -2915,7 +2915,7 @@ impl Vm {
             .unwrap();
 
         #[cfg(target_arch = "aarch64")]
-        let redist_addr = vgic.lock().unwrap().device_properties();
+        let redist_regions = vgic.lock().unwrap().redist_regions().to_vec();
 
         // Configure the vcpus that have been created
         let vcpus = self.cpu_manager.lock().unwrap().vcpus();
@@ -2930,7 +2930,7 @@ impl Vm {
                 .map_err(Error::CpuManager)?;
 
             #[cfg(target_arch = "aarch64")]
-            vcpu.set_gic_redistributor_addr(redist_addr[2], redist_addr[3])
+            vcpu.set_gic_redistributor_addr(&redist_regions)
                 .map_err(Error::CpuManager)?;
         }
 

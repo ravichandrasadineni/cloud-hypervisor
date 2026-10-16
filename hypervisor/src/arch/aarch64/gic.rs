@@ -30,13 +30,19 @@ pub enum Error {
 }
 pub type Result<T> = result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedistRegion {
+    pub base_addr: u64,
+    pub size: u64,
+    pub count: u64,
+}
+
 #[derive(Debug)]
 pub struct VgicConfig {
     pub vcpu_count: u64,
     pub dist_addr: u64,
     pub dist_size: u64,
-    pub redists_addr: u64,
-    pub redists_size: u64,
+    pub redist_regions: Vec<RedistRegion>,
     pub msi_addr: u64,
     pub msi_size: u64,
     pub nr_irqs: u32,
@@ -96,7 +102,10 @@ pub trait Vgic: Send + Sync {
     fn fdt_maint_irq(&self) -> u32;
 
     /// Returns an array with GIC device properties
-    fn device_properties(&self) -> [u64; 4];
+    fn device_properties(&self) -> Vec<u64>;
+
+    /// Returns the redistributor regions configured for this GIC
+    fn redist_regions(&self) -> &[RedistRegion];
 
     /// Returns the number of vCPUs this GIC handles
     fn vcpu_count(&self) -> u64;

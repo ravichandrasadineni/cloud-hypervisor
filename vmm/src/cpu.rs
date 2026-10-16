@@ -27,7 +27,9 @@ use acpi_tables::{Aml, aml};
 use anyhow::anyhow;
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::cache::{CacheTopologyInfo, read_cache_topology};
-use arch::{EntryPoint, NumaNodes, layout};
+#[cfg(target_arch = "x86_64")]
+use arch::layout;
+use arch::{EntryPoint, NumaNodes};
 #[cfg(target_arch = "aarch64")]
 use devices::gic::Gic;
 use devices::interrupt_controller::InterruptController;
@@ -42,7 +44,7 @@ use hypervisor::HypervisorType;
 #[cfg(feature = "guest_debug")]
 use hypervisor::StandardRegisters;
 #[cfg(target_arch = "aarch64")]
-use hypervisor::arch::aarch64::gic::Vgic;
+use hypervisor::arch::aarch64::gic::{RedistRegion, Vgic};
 #[cfg(target_arch = "aarch64")]
 use hypervisor::arch::aarch64::regs::{AARCH64_PMU_IRQ, MPIDR_EL1};
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
@@ -675,13 +677,8 @@ impl Vcpu {
     /// Sets the vCPU's GIC redistributor base address.
     ///
     #[cfg(target_arch = "aarch64")]
-    pub fn set_gic_redistributor_addr(
-        &self,
-        base_redist_addr: u64,
-        redist_size: u64,
-    ) -> Result<()> {
-        let gicr_base = base_redist_addr + (layout::GIC_V3_REDIST_SIZE * self.id as u64);
-        assert!(gicr_base + layout::GIC_V3_REDIST_SIZE <= base_redist_addr + redist_size);
+    pub fn set_gic_redistributor_addr(&self, redist_regions: &[RedistRegion]) -> Result<()> {
+        let gicr_base = Gic::vcpu_gicr_base_addr(redist_regions, self.id as u64);
         self.vcpu
             .set_gic_redistributor_addr(gicr_base)
             .map_err(Error::VcpuSetGicrBaseAddr)?;
@@ -1806,6 +1803,7 @@ impl CpuManager {
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn create_madt(&self, #[cfg(target_arch = "aarch64")] vgic: Arc<Mutex<dyn Vgic>>) -> Sdt {
+        #[cfg(target_arch = "x86_64")]
         use crate::acpi;
         // This is also checked in the commandline parsing.
         assert!(self.config.boot_vcpus <= self.config.max_vcpus);
@@ -1854,104 +1852,13 @@ impl CpuManager {
 
         #[cfg(target_arch = "aarch64")]
         {
-            use arch::layout::{GIC_V2M_COMPATIBLE, GICV2M_SPI_BASE, GICV2M_SPI_NUM};
-
-            /* Notes:
-             * Ignore Local Interrupt Controller Address at byte offset 36 of MADT table.
-             */
-
-            let pmu_supported = self
-                .vcpus
-                .iter()
-                .all(|vcpu| vcpu.lock().unwrap().vcpu.has_pmu_support());
-
-            // See section 5.2.12.14 GIC CPU Interface (GICC) Structure in ACPI spec.
-            for cpu in 0..self.config.boot_vcpus {
-                let mpidr = mpidr_from_vcpu_id(cpu as u64);
-                /* ARMv8 MPIDR format:
-                     Bits [63:40] Must be zero
-                     Bits [39:32] Aff3 : Match Aff3 of target processor MPIDR
-                     Bits [31:24] Must be zero
-                     Bits [23:16] Aff2 : Match Aff2 of target processor MPIDR
-                     Bits [15:8] Aff1 : Match Aff1 of target processor MPIDR
-                     Bits [7:0] Aff0 : Match Aff0 of target processor MPIDR
-                */
-                let mpidr_mask = 0xff_00ff_ffff;
-                let gicc = GicC {
-                    r#type: acpi::ACPI_APIC_GENERIC_CPU_INTERFACE,
-                    length: 80,
-                    reserved0: 0,
-                    cpu_interface_number: cpu,
-                    uid: cpu,
-                    flags: 1,
-                    parking_version: 0,
-                    performance_interrupt: if pmu_supported { AARCH64_PMU_IRQ } else { 0 },
-                    parked_address: 0,
-                    base_address: 0,
-                    gicv_base_address: 0,
-                    gich_base_address: 0,
-                    vgic_interrupt: 0,
-                    gicr_base_address: 0,
-                    mpidr: mpidr & mpidr_mask,
-                    proc_power_effi_class: 0,
-                    reserved1: 0,
-                    spe_overflow_interrupt: 0,
-                };
-
-                madt.append(gicc);
-            }
-            let vgic_config = Gic::create_default_config(self.config.boot_vcpus.into());
-
-            // GIC Distributor structure. See section 5.2.12.15 in ACPI spec.
-            let gicd = GicD {
-                r#type: acpi::ACPI_APIC_GENERIC_DISTRIBUTOR,
-                length: 24,
-                reserved0: 0,
-                gic_id: 0,
-                base_address: vgic_config.dist_addr,
-                global_irq_base: 0,
-                version: 3,
-                reserved1: [0; 3],
-            };
-            madt.append(gicd);
-
-            // See 5.2.12.17 GIC Redistributor (GICR) Structure in ACPI spec.
-            let gicr = GicR {
-                r#type: acpi::ACPI_APIC_GENERIC_REDISTRIBUTOR,
-                length: 16,
-                reserved: 0,
-                base_address: vgic_config.redists_addr,
-                range_length: vgic_config.redists_size as u32,
-            };
-            madt.append(gicr);
-
-            if vgic.lock().unwrap().msi_compatibility() == GIC_V2M_COMPATIBLE {
-                // See 5.2.12.16 GIC MSI Frame Structure in ACPI spec.
-                let gic_msi_frame = GicMsiFrame {
-                    r#type: acpi::ACPI_APIC_GIC_MSI_FRAME,
-                    length: 24,
-                    reserved0: 0,
-                    msi_frame_id: 0,
-                    base_address: vgic_config.msi_addr,
-                    flags: 1,
-                    spi_count: GICV2M_SPI_NUM as u16,
-                    spi_base: GICV2M_SPI_BASE as u16,
-                };
-                madt.append(gic_msi_frame);
-            } else {
-                // See 5.2.12.18 GIC Interrupt Translation Service (ITS) Structure in ACPI spec.
-                let gicits = GicIts {
-                    r#type: acpi::ACPI_APIC_GENERIC_TRANSLATOR,
-                    length: 20,
-                    reserved0: 0,
-                    translation_id: 0,
-                    base_address: vgic_config.msi_addr,
-                    reserved1: 0,
-                };
-                madt.append(gicits);
-            }
-
-            madt.update_checksum();
+            let pmu_supported = !self.vcpus.is_empty()
+                && self
+                    .vcpus
+                    .iter()
+                    .all(|vcpu| vcpu.lock().unwrap().vcpu.has_pmu_support());
+            let vgic = vgic.lock().unwrap();
+            Self::populate_aarch64_madt(&mut madt, self.config.boot_vcpus, pmu_supported, &*vgic);
         }
 
         #[cfg(target_arch = "riscv64")]
@@ -2004,6 +1911,116 @@ impl CpuManager {
         }
 
         madt
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn populate_aarch64_madt(
+        madt: &mut Sdt,
+        boot_vcpus: u32,
+        pmu_supported: bool,
+        vgic: &dyn Vgic,
+    ) {
+        use arch::layout::{GIC_V2M_COMPATIBLE, GICV2M_SPI_BASE, GICV2M_SPI_NUM};
+
+        use crate::acpi;
+
+        /* Notes:
+         * Ignore Local Interrupt Controller Address at byte offset 36 of MADT table.
+         */
+        let redist_regions = vgic.redist_regions();
+
+        // See section 5.2.12.14 GIC CPU Interface (GICC) Structure in ACPI spec.
+        for cpu in 0..boot_vcpus {
+            let mpidr = mpidr_from_vcpu_id(cpu as u64);
+            /* ARMv8 MPIDR format:
+                 Bits [63:40] Must be zero
+                 Bits [39:32] Aff3 : Match Aff3 of target processor MPIDR
+                 Bits [31:24] Must be zero
+                 Bits [23:16] Aff2 : Match Aff2 of target processor MPIDR
+                 Bits [15:8] Aff1 : Match Aff1 of target processor MPIDR
+                 Bits [7:0] Aff0 : Match Aff0 of target processor MPIDR
+            */
+            let mpidr_mask = 0xff_00ff_ffff;
+            let gicr_base_address = Gic::vcpu_gicr_base_addr(redist_regions, cpu as u64);
+            let gicc = GicC {
+                r#type: acpi::ACPI_APIC_GENERIC_CPU_INTERFACE,
+                length: 80,
+                reserved0: 0,
+                cpu_interface_number: cpu,
+                uid: cpu,
+                flags: 1,
+                parking_version: 0,
+                performance_interrupt: if pmu_supported { AARCH64_PMU_IRQ } else { 0 },
+                parked_address: 0,
+                base_address: 0,
+                gicv_base_address: 0,
+                gich_base_address: 0,
+                vgic_interrupt: 0,
+                gicr_base_address,
+                mpidr: mpidr & mpidr_mask,
+                proc_power_effi_class: 0,
+                reserved1: 0,
+                spe_overflow_interrupt: 0,
+            };
+
+            madt.append(gicc);
+        }
+
+        let dist_addr = vgic.device_properties()[0];
+        let msi_addr = vgic.msi_properties()[0];
+
+        // GIC Distributor structure. See section 5.2.12.15 in ACPI spec.
+        let gicd = GicD {
+            r#type: acpi::ACPI_APIC_GENERIC_DISTRIBUTOR,
+            length: 24,
+            reserved0: 0,
+            gic_id: 0,
+            base_address: dist_addr,
+            global_irq_base: 0,
+            version: 3,
+            reserved1: [0; 3],
+        };
+        madt.append(gicd);
+
+        // See 5.2.12.17 GIC Redistributor (GICR) Structure in ACPI spec.
+        for region in redist_regions {
+            let gicr = GicR {
+                r#type: acpi::ACPI_APIC_GENERIC_REDISTRIBUTOR,
+                length: 16,
+                reserved: 0,
+                base_address: region.base_addr,
+                range_length: region.size as u32,
+            };
+            madt.append(gicr);
+        }
+
+        if vgic.msi_compatibility() == GIC_V2M_COMPATIBLE {
+            // See 5.2.12.16 GIC MSI Frame Structure in ACPI spec.
+            let gic_msi_frame = GicMsiFrame {
+                r#type: acpi::ACPI_APIC_GIC_MSI_FRAME,
+                length: 24,
+                reserved0: 0,
+                msi_frame_id: 0,
+                base_address: msi_addr,
+                flags: 1,
+                spi_count: GICV2M_SPI_NUM as u16,
+                spi_base: GICV2M_SPI_BASE as u16,
+            };
+            madt.append(gic_msi_frame);
+        } else {
+            // See 5.2.12.18 GIC Interrupt Translation Service (ITS) Structure in ACPI spec.
+            let gicits = GicIts {
+                r#type: acpi::ACPI_APIC_GENERIC_TRANSLATOR,
+                length: 20,
+                reserved0: 0,
+                translation_id: 0,
+                base_address: msi_addr,
+                reserved1: 0,
+            };
+            madt.append(gicits);
+        }
+
+        madt.update_checksum();
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3820,5 +3837,163 @@ mod tests {
 
         let state = vcpu.get_mp_state().unwrap();
         vcpu.set_mp_state(state).unwrap();
+    }
+
+    use hypervisor::arch::aarch64::gic::{GicState, RedistRegion, Result as GicResult, Vgic};
+
+    struct MockVgic {
+        dist_addr: u64,
+        dist_size: u64,
+        redist_regions: Vec<RedistRegion>,
+        msi_addr: u64,
+        msi_size: u64,
+        vcpu_count: u64,
+    }
+
+    impl Vgic for MockVgic {
+        fn fdt_compatibility(&self) -> &str {
+            "arm,gic-v3"
+        }
+
+        fn fdt_maint_irq(&self) -> u32 {
+            9
+        }
+
+        fn device_properties(&self) -> Vec<u64> {
+            let mut props = Vec::with_capacity(2 + self.redist_regions.len() * 2);
+            props.push(self.dist_addr);
+            props.push(self.dist_size);
+            for region in &self.redist_regions {
+                props.push(region.base_addr);
+                props.push(region.size);
+            }
+            props
+        }
+
+        fn redist_regions(&self) -> &[RedistRegion] {
+            &self.redist_regions
+        }
+
+        fn vcpu_count(&self) -> u64 {
+            self.vcpu_count
+        }
+
+        fn msi_compatible(&self) -> bool {
+            true
+        }
+
+        fn msi_compatibility(&self) -> &str {
+            "arm,gic-v3-its"
+        }
+
+        fn msi_properties(&self) -> [u64; 2] {
+            [self.msi_addr, self.msi_size]
+        }
+
+        fn state(&self) -> GicResult<GicState> {
+            unimplemented!()
+        }
+
+        fn set_state(&mut self, _state: &GicState) -> GicResult<()> {
+            unimplemented!()
+        }
+
+        fn save_data_tables(&self) -> GicResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_create_madt_multi_region_gicr_and_gicc() {
+        use acpi_tables::sdt::Sdt;
+        use devices::gic::Gic;
+        use zerocopy::FromBytes;
+
+        use super::{CpuManager, GicC, GicD, GicIts, GicR};
+        use crate::acpi;
+
+        let config = Gic::create_config(4, &[2, 2]);
+        assert_eq!(config.redist_regions.len(), 2);
+
+        let mock_vgic = MockVgic {
+            dist_addr: config.dist_addr,
+            dist_size: config.dist_size,
+            redist_regions: config.redist_regions.clone(),
+            msi_addr: config.msi_addr,
+            msi_size: config.msi_size,
+            vcpu_count: config.vcpu_count,
+        };
+
+        let mut madt = Sdt::new(*b"APIC", 44, 5, *b"CLOUDH", *b"CHMADT  ", 1);
+        CpuManager::populate_aarch64_madt(&mut madt, 4, false, &mock_vgic);
+
+        let bytes = madt.as_slice();
+        assert!(bytes.len() > 44);
+
+        let mut offset = 44;
+        let mut giccs: Vec<GicC> = Vec::new();
+        let mut gicds: Vec<GicD> = Vec::new();
+        let mut gicrs: Vec<GicR> = Vec::new();
+        let mut gicits_list: Vec<GicIts> = Vec::new();
+
+        while offset < bytes.len() {
+            let subtable_type = bytes[offset];
+            let subtable_len = bytes[offset + 1] as usize;
+            assert!(subtable_len >= 2);
+            assert!(offset + subtable_len <= bytes.len());
+
+            match subtable_type {
+                acpi::ACPI_APIC_GENERIC_CPU_INTERFACE => {
+                    assert_eq!(subtable_len, size_of::<GicC>());
+                    giccs.push(
+                        GicC::read_from_bytes(&bytes[offset..offset + subtable_len]).unwrap(),
+                    );
+                }
+                acpi::ACPI_APIC_GENERIC_DISTRIBUTOR => {
+                    assert_eq!(subtable_len, size_of::<GicD>());
+                    gicds.push(
+                        GicD::read_from_bytes(&bytes[offset..offset + subtable_len]).unwrap(),
+                    );
+                }
+                acpi::ACPI_APIC_GENERIC_REDISTRIBUTOR => {
+                    assert_eq!(subtable_len, size_of::<GicR>());
+                    gicrs.push(
+                        GicR::read_from_bytes(&bytes[offset..offset + subtable_len]).unwrap(),
+                    );
+                }
+                acpi::ACPI_APIC_GENERIC_TRANSLATOR => {
+                    assert_eq!(subtable_len, size_of::<GicIts>());
+                    gicits_list.push(
+                        GicIts::read_from_bytes(&bytes[offset..offset + subtable_len]).unwrap(),
+                    );
+                }
+                other => panic!("Unexpected MADT subtable type {other}"),
+            }
+            offset += subtable_len;
+        }
+
+        assert_eq!(giccs.len(), 4);
+        for (cpu, gicc) in giccs.iter().enumerate() {
+            let gicr_base = gicc.gicr_base_address;
+            let expected_base = Gic::vcpu_gicr_base_addr(&config.redist_regions, cpu as u64);
+            assert_eq!(gicr_base, expected_base);
+            assert_ne!(gicr_base, 0);
+        }
+
+        assert_eq!(gicds.len(), 1);
+        let gicd_base = gicds[0].base_address;
+        assert_eq!(gicd_base, config.dist_addr);
+
+        assert_eq!(gicrs.len(), 2);
+        for (region, gicr) in config.redist_regions.iter().zip(gicrs.iter()) {
+            let base = gicr.base_address;
+            let len = gicr.range_length;
+            assert_eq!(base, region.base_addr);
+            assert_eq!(u64::from(len), region.size);
+        }
+
+        assert_eq!(gicits_list.len(), 1);
+        let its_base = gicits_list[0].base_address;
+        assert_eq!(its_base, config.msi_addr);
     }
 }

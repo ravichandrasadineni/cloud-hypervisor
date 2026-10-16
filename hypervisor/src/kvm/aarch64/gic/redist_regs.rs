@@ -4,7 +4,7 @@
 
 use kvm_ioctls::DeviceFd;
 
-use crate::arch::aarch64::gic::{Error, Result};
+use crate::arch::aarch64::gic::{Error, RedistRegion, Result};
 use crate::arch::aarch64::mpidr_from_vcpu_id;
 use crate::device::HypervisorDeviceError;
 use crate::kvm::kvm_bindings::{KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, kvm_device_attr};
@@ -184,7 +184,7 @@ pub(super) fn set_redist_regs(gic: &DeviceFd, gicr_typer: &[u64], state: &[u32])
     )
 }
 
-pub(super) fn get_gicr_typers(vcpu_count: u64) -> Vec<u64> {
+pub(super) fn get_gicr_typers(redist_regions: &[RedistRegion]) -> Vec<u64> {
     /* Return a GICR_TYPER from the vCPU MPIDR affinities:
      * For our implementation:
      *  Top 32 bits are the affinity value of the associated CPU
@@ -198,13 +198,17 @@ pub(super) fn get_gicr_typers(vcpu_count: u64) -> Vec<u64> {
      *  PLPIS == 0 (physical LPIs not supported)
      */
     let mut gicr_typers: Vec<u64> = Vec::new();
-    for vcpu_id in 0..vcpu_count {
-        let mpidr = mpidr_from_vcpu_id(vcpu_id);
-        let last = (vcpu_id == vcpu_count - 1) as u64;
-        // Calculate affinity.
-        let mut cpu_affid = mpidr & 0xff_00ff_ffff;
-        cpu_affid = ((cpu_affid & 0xFF00000000) >> 8) | (cpu_affid & 0xFFFFFF);
-        gicr_typers.push((cpu_affid << 32) | (1 << 24) | (vcpu_id << 8) | (last << 4));
+    let mut vcpu_id = 0;
+    for region in redist_regions {
+        for idx_in_region in 0..region.count {
+            let mpidr = mpidr_from_vcpu_id(vcpu_id);
+            let last = u64::from(idx_in_region == region.count - 1);
+            // Calculate affinity.
+            let mut cpu_affid = mpidr & 0xff_00ff_ffff;
+            cpu_affid = ((cpu_affid & 0xFF00000000) >> 8) | (cpu_affid & 0xFFFFFF);
+            gicr_typers.push((cpu_affid << 32) | (1 << 24) | (vcpu_id << 8) | (last << 4));
+            vcpu_id += 1;
+        }
     }
 
     gicr_typers

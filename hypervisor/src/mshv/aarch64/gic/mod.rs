@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Vm;
-use crate::arch::aarch64::gic::{GicState, Result, Vgic, VgicConfig};
+use crate::arch::aarch64::gic::{GicState, RedistRegion, Result, Vgic, VgicConfig};
 
 pub struct MshvGicV2M {
     /// GIC distributor address
@@ -15,11 +15,8 @@ pub struct MshvGicV2M {
     /// GIC distributor size
     pub dist_size: u64,
 
-    /// GIC re-distributors address
-    pub redists_addr: u64,
-
-    /// GIC re-distributors size
-    pub redists_size: u64,
+    /// GIC re-distributor regions
+    pub redist_regions: Vec<RedistRegion>,
 
     /// GITS translator address
     pub gits_addr: u64,
@@ -59,8 +56,7 @@ impl MshvGicV2M {
         let gic_device = MshvGicV2M {
             dist_addr: config.dist_addr,
             dist_size: config.dist_size,
-            redists_addr: config.redists_addr,
-            redists_size: config.redists_size,
+            redist_regions: config.redist_regions.clone(),
             gits_addr: config.msi_addr,
             gits_size: config.msi_size,
             vcpu_count: config.vcpu_count,
@@ -94,13 +90,19 @@ impl Vgic for MshvGicV2M {
         [self.gits_addr, self.gits_size]
     }
 
-    fn device_properties(&self) -> [u64; 4] {
-        [
-            self.dist_addr,
-            self.dist_size,
-            self.redists_addr,
-            self.redists_size,
-        ]
+    fn device_properties(&self) -> Vec<u64> {
+        let mut props = Vec::with_capacity(2 + self.redist_regions.len() * 2);
+        props.push(self.dist_addr);
+        props.push(self.dist_size);
+        for region in &self.redist_regions {
+            props.push(region.base_addr);
+            props.push(region.size);
+        }
+        props
+    }
+
+    fn redist_regions(&self) -> &[RedistRegion] {
+        &self.redist_regions
     }
 
     fn state(&self) -> Result<GicState> {

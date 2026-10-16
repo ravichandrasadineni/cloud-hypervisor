@@ -1817,9 +1817,17 @@ impl DeviceManager {
         &mut self,
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Arc<Mutex<dyn InterruptController>>> {
+        let boot_vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
+        let redist_counts: Vec<u64> = self
+            .numa_nodes
+            .values()
+            .map(|node| node.cpus.iter().filter(|&&cpu| cpu < boot_vcpus).count() as u64)
+            .filter(|&count| count > 0)
+            .collect();
         let interrupt_controller: Arc<Mutex<gic::Gic>> = Arc::new(Mutex::new(
             gic::Gic::new(
-                self.config.lock().unwrap().cpus.boot_vcpus,
+                boot_vcpus,
+                &redist_counts,
                 Arc::clone(&self.msi_interrupt_manager)
                     as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
                 Arc::clone(&self.address_manager.vm),

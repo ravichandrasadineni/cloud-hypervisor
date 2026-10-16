@@ -13,9 +13,16 @@ use redist_regs::{get_gicr_typers, get_redist_regs, set_redist_regs};
 use serde::{Deserialize, Serialize};
 
 use crate::Vm;
-use crate::arch::aarch64::gic::{Error, GicState, Result, Vgic, VgicConfig};
+use crate::arch::aarch64::gic::{Error, GicState, RedistRegion, Result, Vgic, VgicConfig};
 use crate::device::HypervisorDeviceError;
 use crate::kvm::KvmVm;
+
+fn encode_redist_region_attr(index: usize, region: &RedistRegion) -> u64 {
+    assert!(region.count > 0 && region.count <= 0xfff);
+    assert!(index <= 0xfff);
+    assert_eq!(region.base_addr & 0xffff, 0);
+    (region.count << 52) | (region.base_addr & 0x000f_ffff_ffff_0000) | (index as u64)
+}
 
 const GITS_CTLR: u32 = 0x0000;
 const GITS_IIDR: u32 = 0x0004;
@@ -89,11 +96,8 @@ pub struct KvmGicV3Its {
     /// GIC distributor size
     dist_size: u64,
 
-    /// GIC distributors address
-    redists_addr: u64,
-
-    /// GIC distributors size
-    redists_size: u64,
+    /// GIC redistributor regions
+    redist_regions: Vec<RedistRegion>,
 
     /// GIC MSI address
     msi_addr: u64,
@@ -158,14 +162,17 @@ impl KvmGicV3Its {
             0,
         )?;
 
-        /* Setting up the redistributors' attribute. */
-        Self::set_device_attribute(
-            &self.device,
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
-            u64::from(kvm_bindings::KVM_VGIC_V3_ADDR_TYPE_REDIST),
-            &raw const self.redists_addr as u64,
-            0,
-        )?;
+        /* Setting up the redistributors' regions attribute. */
+        for (index, region) in self.redist_regions.iter().enumerate() {
+            let val = encode_redist_region_attr(index, region);
+            Self::set_device_attribute(
+                &self.device,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
+                u64::from(kvm_bindings::KVM_VGIC_V3_ADDR_TYPE_REDIST_REGION),
+                &raw const val as u64,
+                0,
+            )?;
+        }
 
         // ITS part attributes
         let mut its_device = kvm_bindings::kvm_create_device {
@@ -268,8 +275,7 @@ impl KvmGicV3Its {
             its_device: None,
             dist_addr: config.dist_addr,
             dist_size: config.dist_size,
-            redists_addr: config.redists_addr,
-            redists_size: config.redists_size,
+            redist_regions: config.redist_regions.clone(),
             msi_addr: config.msi_addr,
             msi_size: config.msi_size,
             vcpu_count: config.vcpu_count,
@@ -302,13 +308,19 @@ impl Vgic for KvmGicV3Its {
         self.vcpu_count
     }
 
-    fn device_properties(&self) -> [u64; 4] {
-        [
-            self.dist_addr,
-            self.dist_size,
-            self.redists_addr,
-            self.redists_size,
-        ]
+    fn device_properties(&self) -> Vec<u64> {
+        let mut props = Vec::with_capacity(2 + self.redist_regions.len() * 2);
+        props.push(self.dist_addr);
+        props.push(self.dist_size);
+        for region in &self.redist_regions {
+            props.push(region.base_addr);
+            props.push(region.size);
+        }
+        props
+    }
+
+    fn redist_regions(&self) -> &[RedistRegion] {
+        &self.redist_regions
     }
 
     fn msi_properties(&self) -> [u64; 2] {
@@ -317,7 +329,7 @@ impl Vgic for KvmGicV3Its {
 
     /// Save the state of GICv3ITS.
     fn state(&self) -> Result<GicState> {
-        let gicr_typers = get_gicr_typers(self.vcpu_count);
+        let gicr_typers = get_gicr_typers(&self.redist_regions);
 
         let gicd_ctlr = read_ctlr(&self.device)?;
 
@@ -387,7 +399,7 @@ impl Vgic for KvmGicV3Its {
     fn set_state(&mut self, state: &GicState) -> Result<()> {
         let kvm_state: Gicv3ItsState = state.clone().into();
 
-        let gicr_typers = get_gicr_typers(self.vcpu_count);
+        let gicr_typers = get_gicr_typers(&self.redist_regions);
 
         write_ctlr(&self.device, kvm_state.gicd_ctlr)?;
 
@@ -469,10 +481,10 @@ impl Vgic for KvmGicV3Its {
 mod tests {
     use crate::HypervisorVmConfig;
     use crate::aarch64::gic::{
-        get_dist_regs, get_gicr_typers, get_icc_regs, get_redist_regs, set_dist_regs, set_icc_regs,
-        set_redist_regs,
+        encode_redist_region_attr, get_dist_regs, get_gicr_typers, get_icc_regs, get_redist_regs,
+        set_dist_regs, set_icc_regs, set_redist_regs,
     };
-    use crate::arch::aarch64::gic::{Vgic, VgicConfig};
+    use crate::arch::aarch64::gic::{RedistRegion, Vgic, VgicConfig};
     use crate::kvm::KvmGicV3Its;
 
     fn create_test_vgic_config() -> VgicConfig {
@@ -481,12 +493,70 @@ mod tests {
             dist_addr: 0x0900_0000 - 0x01_0000,
             dist_size: 0x01_0000,
             // dist_addr - redists_size
-            redists_addr: 0x0900_0000 - 0x01_0000 - 0x02_0000,
-            redists_size: 0x02_0000,
+            redist_regions: vec![RedistRegion {
+                base_addr: 0x0900_0000 - 0x01_0000 - 0x02_0000,
+                size: 0x02_0000,
+                count: 1,
+            }],
             // redists_addr - msi_size
             msi_addr: 0x0900_0000 - 0x01_0000 - 0x02_0000 - 0x02_0000,
             msi_size: 0x02_0000,
             nr_irqs: 256,
+        }
+    }
+
+    #[test]
+    fn test_encode_redist_region_attr() {
+        let region0 = RedistRegion {
+            base_addr: 0x08f8_0000,
+            size: 0x0008_0000,
+            count: 4,
+        };
+        let region1 = RedistRegion {
+            base_addr: 0x08f0_0000,
+            size: 0x0008_0000,
+            count: 4,
+        };
+
+        let val0 = encode_redist_region_attr(0, &region0);
+        assert_eq!(val0 >> 52, 4);
+        assert_eq!(val0 & 0x000f_ffff_ffff_0000, 0x08f8_0000);
+        assert_eq!(val0 & 0xfff, 0);
+
+        let val1 = encode_redist_region_attr(1, &region1);
+        assert_eq!(val1 >> 52, 4);
+        assert_eq!(val1 & 0x000f_ffff_ffff_0000, 0x08f0_0000);
+        assert_eq!(val1 & 0xfff, 1);
+    }
+
+    #[test]
+    fn test_get_gicr_typers_multi_region_last_bit() {
+        let regions = vec![
+            RedistRegion {
+                base_addr: 0x08fc_0000,
+                size: 0x0004_0000,
+                count: 2,
+            },
+            RedistRegion {
+                base_addr: 0x08f8_0000,
+                size: 0x0004_0000,
+                count: 2,
+            },
+        ];
+
+        let typers = get_gicr_typers(&regions);
+        assert_eq!(typers.len(), 4);
+
+        // GICR_TYPER.Last (bit 4) must be set on the last redistributor of each region
+        // (indices 1 and 3) and clear on non-last redistributors (indices 0 and 2).
+        assert_eq!((typers[0] >> 4) & 1, 0);
+        assert_eq!((typers[1] >> 4) & 1, 1);
+        assert_eq!((typers[2] >> 4) & 1, 0);
+        assert_eq!((typers[3] >> 4) & 1, 1);
+
+        // Processor_Number (bits [23:8]) must be consecutive 0..4 across regions.
+        for (i, &typer) in typers.iter().enumerate() {
+            assert_eq!((typer >> 8) & 0xffff, i as u64);
         }
     }
 
@@ -558,12 +628,56 @@ mod tests {
             vcpu_count: 2,
             dist_addr: 0x0900_0000 - 0x01_0000,
             dist_size: 0x01_0000,
-            redists_addr: 0x0900_0000 - 0x01_0000 - 0x04_0000,
-            redists_size: 0x04_0000,
+            redist_regions: vec![RedistRegion {
+                base_addr: 0x0900_0000 - 0x01_0000 - 0x04_0000,
+                size: 0x04_0000,
+                count: 2,
+            }],
             msi_addr: 0x0900_0000 - 0x01_0000 - 0x04_0000 - 0x02_0000,
             msi_size: 0x02_0000,
             nr_irqs: 256,
         }
+    }
+
+    #[test]
+    fn test_create_multi_region_gic() {
+        let hv = crate::new().unwrap();
+        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+
+        let config = VgicConfig {
+            vcpu_count: 4,
+            dist_addr: 0x0800_0000,
+            dist_size: 0x0001_0000,
+            redist_regions: vec![
+                RedistRegion {
+                    base_addr: 0x07fc_0000,
+                    size: 0x0004_0000,
+                    count: 2,
+                },
+                RedistRegion {
+                    base_addr: 0x07f8_0000,
+                    size: 0x0004_0000,
+                    count: 2,
+                },
+            ],
+            msi_addr: 0x07f6_0000,
+            msi_size: 0x0002_0000,
+            nr_irqs: 256,
+        };
+
+        let gic = KvmGicV3Its::new(&*vm, &config).unwrap();
+        assert_eq!(gic.redist_regions(), config.redist_regions.as_slice());
+        assert_eq!(
+            gic.device_properties(),
+            vec![
+                0x0800_0000,
+                0x0001_0000,
+                0x07fc_0000,
+                0x0004_0000,
+                0x07f8_0000,
+                0x0004_0000,
+            ]
+        );
     }
 
     #[test]
@@ -581,13 +695,13 @@ mod tests {
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu1.vcpu_init(&kvi).unwrap();
 
-        let gicr_typers = get_gicr_typers(2);
+        let config = create_test_multi_vcpu_vgic_config();
+        let gicr_typers = get_gicr_typers(&config.redist_regions);
         assert_eq!(gicr_typers.len(), 2);
         let typer0 = vec![gicr_typers[0]];
         let typer1 = vec![gicr_typers[1]];
 
-        let mut gic = KvmGicV3Its::new(&*vm, &create_test_multi_vcpu_vgic_config())
-            .expect("Cannot create gic");
+        let mut gic = KvmGicV3Its::new(&*vm, &config).expect("Cannot create gic");
 
         // Give vCPU0 redistributor state that differs from vCPU1's.
         let mut regs0 = get_redist_regs(&gic.device, &typer0).unwrap();
